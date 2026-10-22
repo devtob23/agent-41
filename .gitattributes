@@ -1,0 +1,5 @@
+* text=auto
+*.sh text eol=lf
+*.py text eol=lf
+*-box/*-box text eol=lf
+*.cmd text eol=crlf whitespace=cr-at-eol

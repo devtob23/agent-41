@@ -1,0 +1,32 @@
+# Agent "claude" for ollama-box: Claude Code with the local Ollama model instead of Anthropic.
+# Usage: ollama-box --agent claude
+# Recommended: a model with tool support and a large context window (ollama-box sets 65536).
+# ollama-box sets SHELL_IMAGE to match --with.
+ARG SHELL_IMAGE=localhost/ollama-agent-shell:latest
+FROM ${SHELL_IMAGE}
+
+USER root
+
+RUN HOME=/root npm install -g @anthropic-ai/claude-code
+
+# No attribution to Claude in commits and pull requests (managed setting, highest precedence).
+RUN mkdir -p /etc/claude-code \
+    && printf '%s\n' '{"attribution":{"commit":"","pr":""}}' > /etc/claude-code/managed-settings.json
+
+# Authenticate against Ollama instead of Anthropic; no updates and no traffic to Anthropic (offline).
+ENV ANTHROPIC_AUTH_TOKEN=ollama \
+    ANTHROPIC_API_KEY="" \
+    DISABLE_AUTOUPDATER=1 \
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
+    CLAUDE_CONFIG_DIR=/home/agent/.claude
+
+# Hand the home directory to the agent user (1000). At runtime ollama-box creates a fresh
+# /home/agent and Podman copies the image contents into it, including ownership.
+RUN rm -rf /home/agent/.npm /home/agent/.cache \
+    && mkdir -p /home/agent \
+    && chown -R 1000:1000 /home/agent
+
+# Ollama address and model come from ollama-box (OLLAMA_HOST, OLLAMA_MODEL).
+# All Claude Code model tiers point to the selected model so that background
+# tasks don't request a Claude model that doesn't exist locally.
+ENTRYPOINT ["sh", "-c", "export ANTHROPIC_BASE_URL=\"$OLLAMA_HOST\" ANTHROPIC_DEFAULT_OPUS_MODEL=\"$OLLAMA_MODEL\" ANTHROPIC_DEFAULT_SONNET_MODEL=\"$OLLAMA_MODEL\" ANTHROPIC_DEFAULT_HAIKU_MODEL=\"$OLLAMA_MODEL\" CLAUDE_CODE_SUBAGENT_MODEL=\"$OLLAMA_MODEL\"; mkdir -p \"$CLAUDE_CONFIG_DIR\"; [ -f \"$CLAUDE_CONFIG_DIR/.claude.json\" ] || echo '{\"hasCompletedOnboarding\":true}' > \"$CLAUDE_CONFIG_DIR/.claude.json\"; exec claude --model \"$OLLAMA_MODEL\" \"$@\"", "claude"]

@@ -1,0 +1,35 @@
+# install.sh backups and traffic captures
+*.bak-*
+*.pcap
+*.pcapng
+# Operating system
+.DS_Store
+Thumbs.db
+
+# Local IDE settings
+.idea/
+
+# Local agent instructions, including the template
+[Cc][Ll][Aa][Uu][Dd][Ee].[Mm][Dd]
+
+# Local environment files; examples and templates stay included
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+
+# Local agent settings and session data
+.claude/settings.local.json
+.claude/settings.local.*.json
+.codex/
+.aider.chat.history.md
+.aider.input.history
+.aider.tags.cache*/
+
+# Python check tools and tests
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+node_modules/

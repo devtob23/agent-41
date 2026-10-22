@@ -1,0 +1,6 @@
+# Internet gateway only; no project, model, or host configuration mounts.
+FROM docker.io/library/python:3.12-slim-bookworm
+COPY internet-proxy.py /opt/ollama-box/internet-proxy.py
+USER 1000:1000
+ENV PYTHONDONTWRITEBYTECODE=1
+ENTRYPOINT ["python3", "-u", "/opt/ollama-box/internet-proxy.py"]

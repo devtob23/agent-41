@@ -1,0 +1,939 @@
+#!/usr/bin/env bash
+# ollama-box: starts a coding agent with a local Ollama model in Podman.
+# Ollama stays internal; agent tools get internet only after per-model approval.
+# Help: ollama-box --help
+set -euo pipefail
+BOX_VERSION="0.3.0"
+BOX_NAME="ollama-box"
+CONFIGURE=0
+ROOT_VARIABLE="OLLAMA_BOX_ROOT"
+
+# ============================================================
+# SETTING: folder where your projects live.
+# Set it with the OLLAMA_BOX_ROOT environment variable, e.g. in ~/.profile.
+# ollama-box only starts directly inside a project in it,
+# i.e. in <PROJECTS_ROOT>/<project>, not deeper and not higher.
+# ============================================================
+PROJECTS_ROOT="${OLLAMA_BOX_ROOT:-}"
+
+CONF_DIR="${OLLAMA_BOX_DIR:-$HOME/.config/ollama-box}"
+GPU_FILE="${CONF_DIR}/gpu"
+OLLAMA_IMAGE="${OLLAMA_BOX_OLLAMA_IMAGE:-docker.io/ollama/ollama:latest}"
+OLLAMA_VOLUME="ollama-box-models"
+OLLAMA_CONTAINER="ollama-box-ollama-<session>"
+NETWORK_NAME="ollama-box-net-<session>"
+AGENT_OWNED=0
+NETWORK_OWNED=0
+CONTAINER_OWNED=0
+MAX_MODELS=50
+# Default context window in tokens (Claude Code gets 65536).
+DEFAULT_CONTEXT=32768
+MAX_ARGS=20
+
+die() {
+  echo "ollama-box: $*" >&2
+  exit 1
+}
+
+# Plain data, never sourced as shell code. Environment overrides the saved path.
+configure_projects() {
+  local saved="${CONF_DIR}/projects-root" candidate answer
+  candidate="$PROJECTS_ROOT"
+  if [ "$CONFIGURE" = 0 ] && [ -f "$saved" ]; then
+    if [ -z "$candidate" ]; then IFS= read -r candidate < "$saved" || true; fi
+  elif [ -t 0 ]; then
+    candidate="${candidate:-$HOME/yourProjectPath}"
+    while true; do
+      read -e -r -p "Projects root [${candidate}] (Tab completes paths): " answer || die "Setup aborted."
+      candidate="${answer:-$candidate}"
+      case "$candidate" in '~') candidate="$HOME" ;; '~/'*) candidate="$HOME/${candidate#\~/}" ;; esac
+      if [ ! -d "$candidate" ]; then echo "Folder does not exist. Please try again." >&2; continue; fi
+      candidate="$(cd "$candidate" && pwd -P)"
+      if [ "$candidate" = / ] || [ "$candidate" = "$(cd "$HOME" && pwd -P)" ]; then
+        echo "Please choose a dedicated projects root, not / or HOME." >&2; continue
+      fi
+      read -r -p "Save ${ROOT_VARIABLE}=${candidate}? [y/N]: " answer || die "Setup aborted."
+      case "$answer" in y|Y|yes|Yes|YES) break ;; *) echo "Please edit the path." >&2 ;; esac
+    done
+    mkdir -p "$CONF_DIR"
+    (umask 077; printf '%s\n' "$candidate" > "$saved")
+  elif [ -z "$candidate" ]; then
+    die "First start needs a terminal; alternatively set ${ROOT_VARIABLE}."
+  fi
+  [ -d "$candidate" ] || die "Projects root '${candidate}' does not exist. Use --configure to change it."
+  PROJECTS_ROOT="$(cd "$candidate" && pwd -P)"
+  export "${ROOT_VARIABLE}=${PROJECTS_ROOT}"
+}
+
+# Podman -v uses colons as field separators; reject ambiguous host paths.
+validate_project_path() {
+  case "$1" in
+    *:*|*,*) die "Project path must not contain a colon or comma." ;;
+  esac
+}
+
+show_version() {
+  printf '%s %s\nScript: %s\nConfiguration: %s\n' "$BOX_NAME" "$BOX_VERSION" "$0" "$CONF_DIR"
+}
+
+# --- Platform: Linux, macOS (Podman machine) or Windows via WSL2 ---
+detect_platform() {
+  case "$(uname -s)" in
+    Linux)
+      if grep -qi microsoft /proc/version 2>/dev/null; then
+        PLATFORM="wsl"
+      else
+        PLATFORM="linux"
+      fi ;;
+    Darwin) PLATFORM="macos" ;;
+    MINGW*|MSYS*|CYGWIN*) PLATFORM="windows" ;;
+    *) PLATFORM="unknown" ;;
+  esac
+}
+
+# Checks whether Podman is installed, recent enough and reachable.
+check_podman() {
+  [ "$PLATFORM" != "windows" ] \
+    || die "On Windows, please start in WSL2. For the Command Prompt there is windows/ollama-box.cmd (see README)."
+  command -v podman >/dev/null 2>&1 || die "podman is not installed. See README, section Requirements."
+  [ "$(id -u)" != "0" ] || die "Do not run as root; rootless Podman is required."
+  local version major minor rest rootless
+  version="$(podman --version 2>/dev/null | awk '{print $NF}')"
+  major="${version%%.*}"
+  rest="${version#*.}"
+  minor="${rest%%.*}"
+  [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ ]] || die "Could not determine the Podman version."
+  if [ "$major" -lt 4 ] || { [ "$major" -eq 4 ] && [ "$minor" -lt 4 ]; }; then
+    die "Podman ${version} is too old; version 4.4 or later is required."
+  fi
+  if ! podman info >/dev/null 2>&1; then
+    [ "$PLATFORM" != "macos" ] || die "Podman is not responding. Is the Podman machine running? Start it with: podman machine start"
+    die "Podman is not responding (podman info fails)."
+  fi
+  rootless="$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null)" \
+    || die "Could not determine whether Podman runs rootless."
+  [ "$rootless" = true ] || die "Podman must run rootless, also over a remote connection."
+  case "$PLATFORM" in
+    macos|wsl) echo "ollama-box: Note: macOS and Windows/WSL2 are experimental and not tested in practice." >&2 ;;
+  esac
+  [ "$PLATFORM" != "unknown" ] || echo "ollama-box: Warning: unknown operating system '$(uname -s)', treating it as Linux." >&2
+}
+
+# Network options for pasta. Newer pasta versions can disable access to the host.
+# Older ones don't know these options; then plain pasta without extra options is used.
+pasta_opts() {
+  local full="pasta:--map-guest-addr,none,--map-host-loopback,none"
+  if [ "$PLATFORM" = "macos" ]; then
+    echo "$full"
+    return 0
+  fi
+  if command -v pasta >/dev/null 2>&1 && pasta --help 2>&1 | grep -q -- '--map-guest-addr'; then
+    echo "$full"
+    return 0
+  fi
+  echo "ollama-box: Note: older pasta version, the extra options that block host access are skipped." >&2
+  echo "pasta"
+}
+
+# Appends a pasta option to existing network options.
+add_pasta_opt() {
+  local opts="$1"
+  local extra="$2"
+  [ -n "$extra" ] || die "internal error: no pasta option."
+  case "$opts" in
+    *:*) echo "${opts},${extra}" ;;
+    *) echo "${opts}:${extra}" ;;
+  esac
+}
+
+show_help() {
+  cat <<EOF
+ollama-box – local Ollama model in Podman, internet for tools after permission
+
+USAGE
+  cd ${PROJECTS_ROOT}/<project>
+  ollama-box [options] [-- arguments for the agent]
+
+  ollama-box run [<model>]       Only chat with the model, without an agent and
+                                 without access to projects (works anywhere)
+
+OPTIONS
+  --version     Show installed script version and paths
+  --configure   Set up the projects root again
+  -h, --help           Show this help
+  --model <name>       Choose a model, e.g. qwen2.5-coder:14b
+                       If omitted: selection menu of downloaded models
+  --agent <name>       Choose an agent (default: ${OLLAMA_BOX_AGENT:-aider})
+  --internet <choice>  ask: ask when needed; allow: allow this session;
+                       deny: this session offline; reset: choose the model decision again
+                       Without option: saved model choice or four first-run options
+  --agents             Show available agents
+  --models             Show downloaded models (works anywhere)
+  --pull <name>        Download a model (works anywhere, needs internet)
+  --rebuild            Rebuild agent images and update the Ollama image
+  --with <list>        Build extra toolchains into the image, comma-separated:
+                       cpp go java lua perl php ruby rust (or all), e.g. --with rust,go
+                       Default is a slim image (Node, Python, Git, GCC/Make).
+                       Permanently: OLLAMA_BOX_WITH=rust,go
+  --gpu <type>         GPU for this start: nvidia, amd or cpu
+  --setup-gpu          Set up GPU: detect, install what is needed, save the choice
+
+WHERE CAN IT START?
+  Only directly in a project folder:   ${PROJECTS_ROOT}/<project>
+  run, --help, --models, --pull, --agents and --setup-gpu work anywhere.
+
+AGENTS
+  Included: shell (Bash), aider, claude (Claude Code), opencode.
+  Only these agents are supported. Containerfiles in the project are ignored.
+
+WHAT THE AGENT SEES IN THE CONTAINER
+  Files:     only the project folder, in the container at /work/<project>
+  Network:   Ollama internal; HTTP/HTTPS for tools only after model permission
+             Private/local targets stay blocked in the gateway. Denying does not stop the agent.
+  Rights:    no special privileges, filesystem read-only except project, /tmp and home
+
+ENVIRONMENT VARIABLES
+  OLLAMA_BOX_MODELS_DIR=<path>|managed  Existing models or managed volume
+  OLLAMA_BOX_NETWORK_MODE=isolated|shared  Network mode (default isolated)
+  OLLAMA_BOX_INTERNET=ask|allow|deny|reset  Internet choice for the selected model
+  OLLAMA_BOX_ROOT=<folder>     Override the saved projects root
+  OLLAMA_BOX_DIR=<folder>      Folder with the Containerfiles instead of ${CONF_DIR}
+  OLLAMA_BOX_MODEL=<name>      Default model, skips the selection menu
+  OLLAMA_BOX_AGENT=<name>      Default agent instead of aider
+  OLLAMA_BOX_CONTEXT=<tokens>  Ollama context window, e.g. 16384 or 65536
+                               Default: 32768, for claude 65536
+  OLLAMA_BOX_GPU=<type>        GPU: nvidia, amd or cpu (overrides the saved choice)
+
+GPU
+  Without a GPU, Ollama runs on the CPU (slow). Set up with:
+    ollama-box --setup-gpu
+  The choice is saved in ${GPU_FILE}. Order:
+  --gpu, then OLLAMA_BOX_GPU, then the saved choice, otherwise cpu.
+  Check whether the GPU is used:  podman exec ${OLLAMA_CONTAINER} ollama ps
+
+FILES
+  ${GPU_FILE}   (saved GPU choice)
+  ${CONF_DIR}/Containerfile.agent-shell
+  ${CONF_DIR}/Containerfile.agent-aider
+  ${CONF_DIR}/Containerfile.agent-claude
+  ${CONF_DIR}/Containerfile.agent-opencode
+EOF
+}
+
+# --- Optional toolchains (--with / OLLAMA_BOX_WITH) ---
+# The default image is slim. Each selection yields its own image (e.g. ollama-agent-shell-go-rust).
+TOOLCHAINS_ALL="cpp go java lua perl php ruby rust"
+WITH="${OLLAMA_BOX_WITH:-}"
+TOOLCHAIN_ARG=""
+TOOLCHAIN_TAG=""
+
+resolve_toolchains() {
+  local want="${WITH//[[:space:]]/}" item t
+  local -a items=() picked=()
+  [ -n "$want" ] || return 0
+  IFS=, read -ra items <<< "$want"
+  for item in "${items[@]}"; do
+    [ -n "$item" ] || continue
+    case " ${TOOLCHAINS_ALL} all " in
+      *" ${item} "*) ;;
+      *) die "Unknown toolchain '${item}'. Available: ${TOOLCHAINS_ALL} or all." ;;
+    esac
+  done
+  for t in $TOOLCHAINS_ALL; do
+    case ",${want}," in *",${t},"*|*",all,"*) picked+=("$t") ;; esac
+  done
+  [ "${#picked[@]}" -gt 0 ] || return 0
+  TOOLCHAIN_ARG="$(IFS=,; echo "${picked[*]}")"
+  TOOLCHAIN_TAG="-$(IFS=-; echo "${picked[*]}")"
+}
+
+# Builds an image from CONF_DIR if it is missing or a rebuild is requested.
+ensure_image() {
+  local name="$1"
+  local file="$2"
+  local force="$3"
+  [ -n "$name" ] || die "internal error: no image name."
+  if [ "$force" = "1" ] || ! podman image exists "localhost/${name}:latest"; then
+    [ -f "${CONF_DIR}/${file}" ] || die "${CONF_DIR}/${file} is missing."
+    echo "ollama-box: building ${name} ..." >&2
+    local old_id new_id
+    local -a build_args=(--build-arg "SHELL_IMAGE=localhost/ollama-agent-shell${TOOLCHAIN_TAG}:latest")
+    if [ "$file" = Containerfile.agent-shell ]; then build_args=(--build-arg "TOOLCHAINS=${TOOLCHAIN_ARG}"); fi
+    old_id="$(podman image inspect --format '{{.Id}}' "localhost/${name}:latest" 2>/dev/null || true)"
+    podman build "${build_args[@]}" -t "$name" -f "${CONF_DIR}/${file}" "$CONF_DIR" || die "Building ${name} failed."
+    # After the rebuild the previous image is untagged and still uses space; remove it.
+    # Fails silently if it is still used by a running container.
+    new_id="$(podman image inspect --format '{{.Id}}' "localhost/${name}:latest" 2>/dev/null || true)"
+    if [ -n "$old_id" ] && [ "$old_id" != "$new_id" ]; then podman rmi "$old_id" >/dev/null 2>&1 || true; fi
+  fi
+}
+
+# Waits at most 60 seconds for Ollama in the given container to respond.
+wait_for_ollama() {
+  local container="$1"
+  [ -n "$container" ] || die "internal error: no container name."
+  local i
+  for i in $(seq 1 60); do
+    if podman exec "$container" ollama list >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  die "Ollama did not start in time (container ${container})."
+}
+
+# ===================== Graphics card =====================
+# Choice: --gpu > OLLAMA_BOX_GPU > saved choice (GPU_FILE) > cpu
+
+# Normalizes a value to nvidia, amd or cpu.
+normalize_gpu() {
+  case "$1" in
+    nvidia|NVIDIA) echo "nvidia" ;;
+    amd|AMD) echo "amd" ;;
+    ""|cpu|CPU|none) echo "cpu" ;;
+    *) die "Invalid GPU value '$1'. Allowed: nvidia, amd, cpu. Set up: ollama-box --setup-gpu" ;;
+  esac
+}
+
+# Saved choice from GPU_FILE, empty if none is saved.
+saved_gpu() {
+  if [ -f "$GPU_FILE" ]; then
+    head -n 1 "$GPU_FILE" | tr -d '[:space:]'
+  fi
+}
+
+# Podman options for the Ollama container depending on GPU_MODE.
+gpu_args() {
+  case "$GPU_MODE" in
+    cpu) ;;
+    nvidia) echo "--device nvidia.com/gpu=all" ;;
+    amd) echo "--device /dev/kfd --device /dev/dri --group-add keep-groups" ;;
+    *) die "internal error: unknown GPU_MODE '${GPU_MODE}'." ;;
+  esac
+}
+
+# Asks yes/no. Without a terminal the answer is always "no".
+ask_yes() {
+  local question="$1"
+  [ -n "$question" ] || die "internal error: no question."
+  [ -t 0 ] || return 1
+  local answer
+  read -r -p "${question} [y/N] " answer || return 1
+  case "$answer" in
+    y|Y|yes|Yes|YES) return 0 ;;
+  esac
+  return 1
+}
+
+# Runs a displayed command with sudo.
+run_root() {
+  local cmd="$1"
+  [ -n "$cmd" ] || die "internal error: no command."
+  echo "  sudo: ${cmd}" >&2
+  sudo sh -c "$cmd" || die "Command failed: ${cmd}"
+}
+
+# Commands to install the NVIDIA Container Toolkit for the available package manager.
+# Source: NVIDIA Container Toolkit, installation guide.
+nvidia_install_cmds() {
+  local repo="https://nvidia.github.io/libnvidia-container"
+  local key="/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg"
+  if command -v apt-get >/dev/null 2>&1; then
+    echo "curl -fsSL ${repo}/gpgkey | gpg --dearmor --yes -o ${key}"
+    echo "curl -s -L ${repo}/stable/deb/nvidia-container-toolkit.list | sed 's#deb https://#deb [signed-by=${key}] https://#g' > /etc/apt/sources.list.d/nvidia-container-toolkit.list"
+    echo "apt-get update"
+    echo "apt-get install -y nvidia-container-toolkit"
+  elif command -v dnf >/dev/null 2>&1; then
+    echo "curl -s -L ${repo}/stable/rpm/nvidia-container-toolkit.repo -o /etc/yum.repos.d/nvidia-container-toolkit.repo"
+    echo "dnf install -y nvidia-container-toolkit"
+  elif command -v zypper >/dev/null 2>&1; then
+    echo "zypper lr nvidia-container-toolkit >/dev/null 2>&1 || zypper --non-interactive ar ${repo}/stable/rpm/nvidia-container-toolkit.repo"
+    echo "zypper --non-interactive --gpg-auto-import-keys install -y nvidia-container-toolkit"
+  elif command -v pacman >/dev/null 2>&1; then
+    echo "pacman -S --needed --noconfirm nvidia-container-toolkit"
+  else
+    return 1
+  fi
+}
+
+# Installs the NVIDIA Container Toolkit if needed (after confirmation).
+ensure_nvidia_toolkit() {
+  if command -v nvidia-ctk >/dev/null 2>&1; then
+    echo "  NVIDIA Container Toolkit: present"
+    return 0
+  fi
+  local cmds
+  cmds="$(nvidia_install_cmds)" \
+    || die "Unknown package manager. Please install the toolkit manually (docs/MANUAL.md)."
+  case "$cmds" in
+    *curl*) command -v curl >/dev/null 2>&1 || die "curl is missing. Please install curl first." ;;
+  esac
+  echo "  NVIDIA Container Toolkit: missing. These commands would be run with sudo:"
+  echo "$cmds" | sed 's/^/    /'
+  ask_yes "  Install now?" || die "Aborted. Manual installation guide: docs/MANUAL.md"
+  local lines=()
+  local line
+  while IFS= read -r line; do
+    lines+=("$line")
+  done <<EOF
+$cmds
+EOF
+  local i
+  for i in $(seq 1 "${#lines[@]}"); do
+    run_root "${lines[$((i - 1))]}"
+  done
+  command -v nvidia-ctk >/dev/null 2>&1 || die "nvidia-ctk is not available after the installation."
+}
+
+# Generates the device specification (CDI) for Podman if needed (after confirmation).
+ensure_nvidia_cdi() {
+  if nvidia-ctk cdi list 2>/dev/null | grep -q 'nvidia.com/gpu=all'; then
+    echo "  CDI device spec for Podman: present"
+    return 0
+  fi
+  echo "  CDI device spec for Podman: missing."
+  ask_yes "  Generate now (sudo nvidia-ctk cdi generate)?" || die "Aborted."
+  run_root "nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml"
+  nvidia-ctk cdi list 2>/dev/null | grep -q 'nvidia.com/gpu=all' || die "CDI device spec was not generated."
+}
+
+setup_nvidia() {
+  echo "NVIDIA:"
+  if ! command -v nvidia-smi >/dev/null 2>&1 || ! nvidia-smi -L >/dev/null 2>&1; then
+    die "NVIDIA driver is missing or not working (nvidia-smi). Install the driver first, then: ollama-box --setup-gpu"
+  fi
+  nvidia-smi -L | sed 's/^/  found: /'
+  ensure_nvidia_toolkit
+  ensure_nvidia_cdi
+  echo "  Test: accessing the GPU from a container ..."
+  podman run --rm --device nvidia.com/gpu=all --entrypoint nvidia-smi "$OLLAMA_IMAGE" -L \
+    || die "Test failed: Podman cannot pass the GPU through (docs/MANUAL.md, section GPU setup)."
+  echo "  Test passed."
+}
+
+setup_amd() {
+  echo "AMD:"
+  [ -e /dev/kfd ] || die "/dev/kfd is missing: no AMD ROCm device found. Check the driver (amdgpu) and ROCm support."
+  local missing=""
+  local g
+  for g in video render; do
+    if getent group "$g" >/dev/null 2>&1 && ! id -nG | tr ' ' '\n' | grep -qx "$g"; then
+      missing="${missing} ${g}"
+    fi
+  done
+  if [ -n "$missing" ]; then
+    echo "  Your user is missing from the groups:${missing}"
+    ask_yes "  Add now (sudo usermod)?" || die "Aborted."
+    run_root "usermod -aG $(echo $missing | tr ' ' ',') $(id -un)"
+    echo "  Please log out and back in once so the new groups take effect."
+  else
+    echo "  Groups video and render: ok"
+  fi
+  if [ ! -r /dev/kfd ] || [ ! -w /dev/kfd ]; then
+    echo "  Note: /dev/kfd is not yet readable and writable for you (check again after logging back in)."
+  fi
+}
+
+# Interactive setup: choose graphics card, install what is needed, save the choice.
+setup_gpu() {
+  case "$PLATFORM" in
+    linux|wsl) ;;
+    *) die "GPU setup is only available on Linux and WSL2. On macOS, Ollama runs on the CPU." ;;
+  esac
+  [ -t 0 ] || die "--setup-gpu needs a terminal for questions."
+  local nv="no"
+  local amd="no"
+  if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+    nv="yes"
+  fi
+  if [ -e /dev/kfd ]; then
+    amd="yes"
+  fi
+  echo "Set up GPU for ollama-box"
+  echo "  detected: NVIDIA with driver: ${nv}, AMD with ROCm (/dev/kfd): ${amd}"
+  local current
+  current="$(saved_gpu)"
+  echo "  currently saved: ${current:-no choice (CPU)}"
+  echo "  1) NVIDIA"
+  echo "  2) AMD"
+  echo "  3) no GPU (CPU only)"
+  local mode=""
+  local attempt choice
+  for attempt in 1 2 3; do
+    read -r -p "Choice [1-3]: " choice || die "No input."
+    case "$choice" in
+      1) mode="nvidia"; break ;;
+      2) mode="amd"; break ;;
+      3) mode="cpu"; break ;;
+    esac
+    echo "Invalid choice (${attempt}/3)."
+  done
+  [ -n "$mode" ] || die "No valid choice."
+  case "$mode" in
+    nvidia) setup_nvidia ;;
+    amd) setup_amd ;;
+  esac
+  mkdir -p "$CONF_DIR" || die "Could not create ${CONF_DIR}."
+  echo "$mode" > "$GPU_FILE" || die "Could not write ${GPU_FILE}."
+  echo "Saved: ${mode} (in ${GPU_FILE})."
+  echo "For a single run: ollama-box --gpu <nvidia|amd|cpu>. If Ollama is running, it restarts on the next start."
+}
+
+
+
+# The configured path points directly to Ollama's models directory (blobs/manifests).
+# It is stored as data, never evaluated as shell code or written by the container.
+configure_models() {
+  local file="${CONF_DIR}/models-source" choice answer candidate
+  choice="${OLLAMA_BOX_MODELS_DIR:-}"
+  if [ -z "$choice" ] && [ -f "$file" ] && [ "$CONFIGURE" = 0 ]; then
+    IFS= read -r choice < "$file" || true
+  fi
+  if [ -z "$choice" ]; then
+    choice=managed
+    if [ -t 0 ]; then
+      read -r -p "Use Ollama models already downloaded on this host? [y/N]: " answer || die "Aborted."
+      case "$answer" in
+        y|Y|yes|Yes|YES)
+          candidate="$HOME/.ollama/models"
+          while true; do
+            read -r -p "Models folder with blobs/ and manifests/ [${candidate}]: " answer || die "Aborted."
+            candidate="${answer:-$candidate}"
+            case "$candidate" in '~/'*) candidate="$HOME/${candidate#\~/}" ;; esac
+            if ! valid_models_directory "$candidate"; then continue; fi
+            candidate="$(cd "$candidate" && pwd -P)"
+            read -r -p "Use models from '${candidate}' read-only? [y/N]: " answer || die "Aborted."
+            case "$answer" in y|Y|yes|Yes|YES) choice="$candidate"; break ;; *) echo "Please edit the path." >&2 ;; esac
+          done ;;
+      esac
+      mkdir -p "$CONF_DIR"
+      (umask 077; printf '%s\n' "$choice" > "$file")
+    fi
+  fi
+  MODELS_DIR=""
+  MODELS_CONTAINER_PATH=/models-store/models
+  MODELS_MOUNT="${OLLAMA_VOLUME}:/models-store:ro"
+  if [ "$choice" != managed ]; then
+    valid_models_directory "$choice" || die "Invalid models folder; use --configure to change it."
+    MODELS_DIR="$(cd "$choice" && pwd -P)"
+    MODELS_CONTAINER_PATH=/models-store
+    MODELS_MOUNT="${MODELS_DIR}:/models-store:ro"
+  fi
+}
+
+valid_models_directory() {
+  case "$1" in *:*|*,*) echo "Models path must not contain a colon or comma." >&2; return 1 ;; esac
+  if [ ! -d "$1/blobs" ] || [ ! -d "$1/manifests" ] || [ ! -r "$1" ] || [ ! -x "$1" ]; then
+    echo "Choose a readable Ollama models folder with blobs/ and manifests/, not a single model file." >&2
+    return 1
+  fi
+}
+
+configure_network() {
+  local file="${CONF_DIR}/network-mode" answer
+  NETWORK_MODE="${OLLAMA_BOX_NETWORK_MODE:-}"
+  if [ -z "$NETWORK_MODE" ] && [ -f "$file" ] && [ "$CONFIGURE" = 0 ]; then
+    IFS= read -r NETWORK_MODE < "$file" || true
+  fi
+  if [ -z "$NETWORK_MODE" ]; then
+    NETWORK_MODE=isolated
+    if [ -t 0 ]; then
+      echo "Ollama: the default is a separate internal network and one server per session." >&2
+      echo "Sharing saves RAM/VRAM but allows network access between sessions." >&2
+      read -r -p "Share network and Ollama server between sessions? [y/N]: " answer || die "Aborted."
+      case "$answer" in y|Y|yes|Yes|YES) NETWORK_MODE=shared ;; esac
+      mkdir -p "$CONF_DIR"
+      (umask 077; printf '%s\n' "$NETWORK_MODE" > "$file")
+    fi
+  fi
+  case "$NETWORK_MODE" in isolated|shared) ;; *) die "Network mode must be isolated or shared." ;; esac
+  if [ "$NETWORK_MODE" = isolated ]; then
+    local session
+    session="$(date +%s)-$$-${RANDOM}"
+    NETWORK_NAME="ollama-box-net-${session}"
+    OLLAMA_CONTAINER="ollama-box-ollama-${session}"
+    AGENT_SUFFIX="$session"
+  else
+    NETWORK_NAME=ollama-box-net-shared
+    OLLAMA_CONTAINER=ollama-box-ollama-shared
+    AGENT_SUFFIX="$$-${RANDOM}"
+  fi
+  OLLAMA_URL="http://${OLLAMA_CONTAINER}:11434"
+}
+
+validate_resource() {
+  local kind="$1" name="$2"
+  shift 2
+  podman "$kind" inspect "$name" | python3 "${CONF_DIR}/validate-resource.py" "$kind" "$NETWORK_NAME" "$@" \
+    || die "Unsafe or foreign resource '${name}'. Left unchanged; please check manually."
+}
+
+ensure_models_volume() {
+  if ! podman volume exists "$OLLAMA_VOLUME"; then
+    podman volume create --label io.agent-41.owner=ollama-box "$OLLAMA_VOLUME" >/dev/null \
+      || die "Could not create the models volume."
+    podman run --rm --network none --cap-drop=ALL --security-opt no-new-privileges \
+      -v "${OLLAMA_VOLUME}:/root/.ollama:rw" --entrypoint /bin/mkdir \
+      "$OLLAMA_IMAGE" -p /root/.ollama/models >/dev/null || die "Could not create the models directory."
+  fi
+  validate_resource volume "$OLLAMA_VOLUME"
+}
+
+start_ollama() {
+  local ctx="$1" image="$OLLAMA_IMAGE" wanted gpu
+  [[ "$ctx" =~ ^[0-9]+$ ]] || die "Context window must be a number."
+  if [ "$GPU_MODE" = amd ] && [ -z "${OLLAMA_BOX_OLLAMA_IMAGE:-}" ]; then image=docker.io/ollama/ollama:rocm; fi
+  wanted="ctx=${ctx},gpu=${GPU_MODE}"
+  if [ -z "${MODELS_DIR:-}" ]; then ensure_models_volume; fi
+  if ! podman network exists "$NETWORK_NAME"; then
+    podman network create --internal --label io.agent-41.owner=ollama-box \
+      --label "io.agent-41.scope=${NETWORK_NAME}" "$NETWORK_NAME" >/dev/null || die "Could not create the network."
+    NETWORK_OWNED=1
+  fi
+  validate_resource network "$NETWORK_NAME"
+  if podman container exists "$OLLAMA_CONTAINER"; then
+    validate_resource container "$OLLAMA_CONTAINER" "$image" "$wanted" "${MODELS_DIR:-}"
+    [ "$(podman container inspect -f '{{.State.Running}}' "$OLLAMA_CONTAINER")" = true ] \
+      || podman start "$OLLAMA_CONTAINER" >/dev/null
+  else
+    gpu="$(gpu_args)"
+    # gpu contains only fixed, validated arguments from gpu_args.
+    # shellcheck disable=SC2086
+    podman run -d --name "$OLLAMA_CONTAINER" --network "$NETWORK_NAME" \
+      --label io.agent-41.owner=ollama-box --label "io.agent-41.scope=${NETWORK_NAME}" \
+      --label "ollama-box.config=${wanted}" \
+      --cap-drop=ALL --security-opt no-new-privileges --read-only \
+      --tmpfs /tmp:rw,nosuid,nodev,size=1g --tmpfs /root/.cache:rw,nosuid,nodev,size=512m \
+      --tmpfs /root/.ollama:rw,nosuid,nodev,size=16m \
+      -v "${MODELS_MOUNT:-${OLLAMA_VOLUME}:/models-store:ro}" -e "OLLAMA_MODELS=${MODELS_CONTAINER_PATH:-/models-store/models}" \
+      -e "OLLAMA_CONTEXT_LENGTH=${ctx}" \
+      $gpu "$image" >/dev/null || die "Could not start Ollama."
+    CONTAINER_OWNED=1
+    validate_resource container "$OLLAMA_CONTAINER" "$image" "$wanted" "${MODELS_DIR:-}"
+  fi
+  wait_for_ollama "$OLLAMA_CONTAINER"
+}
+
+stop_ollama_if_unused() {
+  if [ "$AGENT_OWNED" = 1 ]; then podman rm -f "ollama-agent-${PROJECT}-${AGENT_SUFFIX}" >/dev/null 2>&1 || true; fi
+  # Shared resources stay alive: another session may be starting concurrently.
+  [ "$NETWORK_MODE" = isolated ] || return 0
+  if [ "$CONTAINER_OWNED" = 1 ]; then podman rm -f "$OLLAMA_CONTAINER" >/dev/null 2>&1 || true; fi
+  if [ "$NETWORK_OWNED" = 1 ]; then podman network rm "$NETWORK_NAME" >/dev/null 2>&1 || true; fi
+}
+
+# Prints the downloaded models (at most MAX_MODELS), one per line.
+installed_models() {
+  podman exec "$OLLAMA_CONTAINER" ollama list | awk 'NR>1 && $1 != "" {print $1}' | head -n "$MAX_MODELS"
+}
+
+# Selection menu; sets the global variable MODEL.
+choose_model() {
+  local models=()
+  local line
+  while IFS= read -r line; do
+    models+=("$line")
+  done < <(installed_models)
+  local count="${#models[@]}"
+  [ "$count" -gt 0 ] || die "No models available. Download one first: ollama-box --pull <model>"
+  if [ "$count" -eq 1 ]; then
+    MODEL="${models[0]}"
+    return 0
+  fi
+  [ -t 0 ] || die "Several models available, but no input possible. Please pass --model <name>."
+  echo "Downloaded models:" >&2
+  local i
+  for i in $(seq 1 "$count"); do
+    echo "  ${i}) ${models[$((i - 1))]}" >&2
+  done
+  local attempt choice
+  for attempt in 1 2 3; do
+    read -r -p "Choose model [1-${count}]: " choice || die "No input."
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$count" ]; then
+      MODEL="${models[$((choice - 1))]}"
+      return 0
+    fi
+    echo "Invalid choice (${attempt}/3)." >&2
+  done
+  die "No valid choice."
+}
+
+# Pulls a model with a short-lived Ollama container, the only one that gets internet.
+pull_model() (
+  local name="$1"
+  [ -n "$name" ] || die "--pull needs a model name, e.g. --pull qwen2.5-coder:14b"
+  [ -z "${MODELS_DIR:-}" ] || die "External models are read-only. Download new models with your host Ollama or switch to the managed volume with --configure."
+  local pull_container="ollama-box-pull-$$-${RANDOM}"
+  ensure_models_volume
+  podman run -d --rm \
+    --name "$pull_container" \
+    --network "$(pasta_opts)" \
+    --cap-drop=ALL \
+    --security-opt no-new-privileges \
+    -v "${OLLAMA_VOLUME}:/root/.ollama:rw" \
+    "$OLLAMA_IMAGE" >/dev/null || die "Could not start the download container."
+  trap 'podman rm -f "$pull_container" >/dev/null 2>&1 || true' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  wait_for_ollama "$pull_container"
+  local rc=0
+  podman exec -it "$pull_container" ollama pull "$name" || rc=$?
+  podman rm -f "$pull_container" >/dev/null 2>&1 || true
+  [ "$rc" -eq 0 ] || die "Download of ${name} failed."
+  echo "ollama-box: ${name} downloaded." >&2
+)
+
+# --- ollama-box options ---
+REBUILD=0
+MODEL="${OLLAMA_BOX_MODEL:-}"
+AGENT="${OLLAMA_BOX_AGENT:-aider}"
+ACTION="agent"
+PULL_NAME=""
+GPU_OPT=""
+INTERNET_OPT="${OLLAMA_BOX_INTERNET:-}"
+n=0
+while [ $# -gt 0 ] && [ "$n" -lt "$MAX_ARGS" ]; do
+  n=$((n + 1))
+  case "$1" in
+    --version) show_version; exit 0 ;;
+    --configure) CONFIGURE=1; shift ;;
+    -h|--help) show_help; exit 0 ;;
+    run)
+      # Only as the first argument: chat without an agent. Optionally followed by the model name.
+      [ "$n" -eq 1 ] || break
+      ACTION="chat"
+      shift
+      if [ $# -gt 0 ] && [ "${1#-}" = "$1" ]; then
+        MODEL="$1"
+        shift
+      fi ;;
+    --models) ACTION="models"; shift ;;
+    --agents) ACTION="agents"; shift ;;
+    --pull) [ $# -ge 2 ] || die "--pull needs a model name."; ACTION="pull"; PULL_NAME="$2"; shift 2 ;;
+    --model) [ $# -ge 2 ] || die "--model needs a name."; MODEL="$2"; shift 2 ;;
+    --agent) [ $# -ge 2 ] || die "--agent needs a name."; AGENT="$2"; shift 2 ;;
+    --internet) [ $# -ge 2 ] || die "--internet needs ask, allow, deny or reset."; INTERNET_OPT="$2"; shift 2 ;;
+    --rebuild) REBUILD=1; shift ;;
+    --with) [ $# -ge 2 ] || die "--with needs a list, e.g. --with rust,go."; WITH="$2"; shift 2 ;;
+    --with=*) WITH="${1#--with=}"; shift ;;
+    --gpu) [ $# -ge 2 ] || die "--gpu needs nvidia, amd or cpu."; GPU_OPT="$2"; shift 2 ;;
+    --setup-gpu) ACTION="setupgpu"; shift ;;
+    --) shift; break ;;
+    *) break ;;
+  esac
+done
+
+resolve_toolchains
+
+case "$INTERNET_OPT" in
+  ''|ask|allow|deny|reset) ;;
+  *) die "--internet must be ask, allow, deny or reset." ;;
+esac
+
+if [ "$ACTION" = agent ] || [ "$CONFIGURE" = 1 ]; then configure_projects; fi
+configure_models
+configure_network
+[ "$CONFIGURE" = 0 ] || exit 0
+
+command -v python3 >/dev/null 2>&1 || die "Python 3 on the host is required for resource checks."
+[ -f "${CONF_DIR}/validate-resource.py" ] || die "validate-resource.py is missing; run ./install.sh ollama again."
+
+# On the first start of a session, offer once to set up the detected graphics card.
+# Only with a terminal, on Linux/WSL2, and while there is neither a saved choice nor an option (--gpu, OLLAMA_BOX_GPU).
+# A refusal is saved as cpu so the question isn't asked on every start.
+offer_gpu_setup() {
+  case "$PLATFORM" in linux|wsl) ;; *) return 0 ;; esac
+  [ -t 0 ] || return 0
+  [ -z "${GPU_OPT:-}${OLLAMA_BOX_GPU:-}" ] || return 0
+  [ ! -f "$GPU_FILE" ] || return 0
+  local found=""
+  if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+    found="NVIDIA"
+  elif [ -e /dev/kfd ]; then
+    found="AMD"
+  fi
+  [ -n "$found" ] || return 0
+  echo "GPU detected (${found}). ollama-box can use it for the models; without it Ollama" >&2
+  echo "runs on the CPU. The setup asks before every installation." >&2
+  echo "It downloads the Ollama image once (several GB), which ollama-box needs anyway." >&2
+  local answer
+  read -r -p "Set up now? [y/N] " answer || return 0
+  case "$answer" in
+    y|Y|yes|Yes|YES) setup_gpu ;;
+    *)
+      mkdir -p "$CONF_DIR" && echo cpu > "$GPU_FILE" || die "Could not write ${GPU_FILE}."
+      echo "Continuing with CPU. Set up later with: ollama-box --setup-gpu" >&2 ;;
+  esac
+}
+
+detect_platform
+check_podman
+
+# On macOS the project lives in the Podman machine on a virtiofs volume;
+# SELinux relabeling (:Z) is not supported there.
+MOUNT_Z=":Z"
+if [ "$PLATFORM" = "macos" ]; then
+  MOUNT_Z=""
+fi
+
+if [ "$ACTION" = "setupgpu" ]; then
+  setup_gpu
+  exit 0
+fi
+
+case "$ACTION" in agent|chat) offer_gpu_setup ;; esac
+
+# Graphics card: --gpu > OLLAMA_BOX_GPU > saved choice > cpu
+GPU_VALUE="${GPU_OPT:-${OLLAMA_BOX_GPU:-}}"
+if [ -z "$GPU_VALUE" ]; then
+  GPU_VALUE="$(saved_gpu)"
+fi
+GPU_MODE="$(normalize_gpu "$GPU_VALUE")"
+if [ "$GPU_MODE" != "cpu" ] && [ "$PLATFORM" = "macos" ]; then
+  die "GPUs are not supported on macOS; Ollama runs on the CPU in the Podman machine."
+fi
+
+case "$ACTION" in
+  agents)
+    echo "Agents in ${CONF_DIR}:"
+    printf '  %s\n' shell aider claude opencode
+    exit 0 ;;
+  pull)
+    pull_model "$PULL_NAME"
+    exit 0 ;;
+  models)
+    trap stop_ollama_if_unused EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    start_ollama "${OLLAMA_BOX_CONTEXT:-$DEFAULT_CONTEXT}"
+    echo "Downloaded models:"
+    installed_models | sed 's/^/  /'
+    exit 0 ;;
+  chat)
+    trap stop_ollama_if_unused EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    start_ollama "${OLLAMA_BOX_CONTEXT:-$DEFAULT_CONTEXT}"
+    if [ -z "$MODEL" ]; then
+      choose_model
+    fi
+    installed_models | grep -Fxq "$MODEL" \
+      || die "Model '${MODEL}' is not downloaded. Download it with: ollama-box --pull ${MODEL}"
+    echo "ollama-box: chat with ${MODEL}, offline and without access to projects. Quit with /bye" >&2
+    rc=0
+    podman exec -it "$OLLAMA_CONTAINER" ollama run "$MODEL" || rc=$?
+    exit "$rc" ;;
+esac
+
+case "$AGENT" in
+  shell|aider|claude|opencode) ;;
+  *) die "Unknown agent '${AGENT}'. Allowed: shell, aider, claude, opencode." ;;
+esac
+
+# --- Safety check: only directly in <PROJECTS_ROOT>/<project> ---
+[ -d "$PROJECTS_ROOT" ] || die "Projects root '${PROJECTS_ROOT}' does not exist. Create the folder or set OLLAMA_BOX_ROOT (see README)."
+ROOT_REAL="$(cd "$PROJECTS_ROOT" && pwd -P)"
+PROJECT_DIR="$(pwd -P)"
+validate_project_path "$PROJECT_DIR"
+
+case "$ROOT_REAL" in
+  "/"|"$(cd "$HOME" && pwd -P)")
+    die "PROJECTS_ROOT must not be '/' or your home directory." ;;
+esac
+
+case "$PROJECT_DIR" in
+  "$ROOT_REAL")
+    die "You are in the projects root itself (${ROOT_REAL}). Please change into a project: cd ${ROOT_REAL}/<project>" ;;
+  "$ROOT_REAL"/*/*)
+    REL="${PROJECT_DIR#"$ROOT_REAL"/}"
+    die "You are in a subfolder of a project. Please start in the project itself: cd ${ROOT_REAL}/${REL%%/*}" ;;
+  "$ROOT_REAL"/?*)
+    ;;
+  *)
+    die "'${PROJECT_DIR}' is not inside ${ROOT_REAL}. ollama-box only starts in ${ROOT_REAL}/<project>. Help: ollama-box --help" ;;
+esac
+
+PROJECT="$(basename "$PROJECT_DIR" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9._-' '-')"
+PROJECT="${PROJECT%-}"
+
+# --- Images ---
+if [ "$REBUILD" = "1" ]; then
+  podman pull "$OLLAMA_IMAGE" || die "Could not update the Ollama image."
+fi
+ensure_image "ollama-agent-shell${TOOLCHAIN_TAG}" Containerfile.agent-shell "$REBUILD"
+if [ "$AGENT" != "shell" ]; then
+  ensure_image "ollama-agent-${AGENT}${TOOLCHAIN_TAG}" "Containerfile.agent-${AGENT}" "$REBUILD"
+fi
+IMAGE="ollama-agent-${AGENT}${TOOLCHAIN_TAG}"
+
+
+# --- Context window: own setting, otherwise the matching default per agent ---
+CONTEXT="${OLLAMA_BOX_CONTEXT:-}"
+if [ -z "$CONTEXT" ]; then
+  case "$AGENT" in
+    claude) CONTEXT=65536 ;;
+    *) CONTEXT="$DEFAULT_CONTEXT" ;;
+  esac
+fi
+
+# --- Start Ollama and choose the model ---
+trap stop_ollama_if_unused EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+start_ollama "$CONTEXT"
+
+if [ -z "$MODEL" ]; then
+  choose_model
+fi
+installed_models | grep -Fxq "$MODEL" \
+  || die "Model '${MODEL}' is not downloaded. Download it with: ollama-box --pull ${MODEL}"
+
+[ -f "${CONF_DIR}/internet-access.py" ] && [ -f "${CONF_DIR}/internet-proxy.py" ] \
+  && [ -f "${CONF_DIR}/Containerfile.internet-proxy" ] \
+  || die "Internet permission files are missing; run ./install.sh ollama again."
+INTERNET_ARGS=()
+[ -z "$INTERNET_OPT" ] || INTERNET_ARGS+=(--internet "$INTERNET_OPT")
+[ "$REBUILD" = 0 ] || INTERNET_ARGS+=(--rebuild)
+
+# --- Environment ---
+GIT_NAME="$(git config user.name || true)"
+GIT_EMAIL="$(git config user.email || true)"
+
+echo "ollama-box: ${PROJECT_DIR} -> /work/${PROJECT}" >&2
+echo "ollama-box: agent ${AGENT}, model ${MODEL}, context window ${CONTEXT:-default}, GPU ${GPU_MODE}; internet after model permission" >&2
+
+# --userns=keep-id:...  your user becomes user 1000 in the container; files belong to you
+# --read-only           filesystem read-only except project, /tmp and home
+# --network             internal network only: Ollama yes, internet, home network and host no
+# HTTP/HTTPS can only go through the separately controlled gateway.
+rc=0
+AGENT_OWNED=1
+AGENT_TTY=(-i)
+if [ -t 0 ] && [ -t 1 ]; then AGENT_TTY+=(-t); fi
+python3 "${CONF_DIR}/internet-access.py" \
+  --config "$CONF_DIR" --model "$MODEL" --network "$NETWORK_NAME" \
+  --session "$AGENT_SUFFIX" --ollama-host "$OLLAMA_CONTAINER" \
+  "${INTERNET_ARGS[@]}" -- podman run --rm "${AGENT_TTY[@]}" \
+  --name "ollama-agent-${PROJECT}-${AGENT_SUFFIX}" \
+  --hostname "ollama-agent-${PROJECT}" \
+  --network "$NETWORK_NAME" \
+  --userns=keep-id:uid=1000,gid=1000 \
+  --user 1000:1000 \
+  --cap-drop=ALL \
+  --security-opt no-new-privileges \
+  --read-only \
+  --tmpfs /tmp:rw,nosuid,nodev,size=1g \
+  --tmpfs /home/agent:rw,nosuid,nodev,size=1g,mode=1777 \
+  -e HOME=/home/agent \
+  -v "${PROJECT_DIR}:/work/${PROJECT}${MOUNT_Z}" \
+  -w "/work/${PROJECT}" \
+  -e "OLLAMA_HOST=${OLLAMA_URL}" \
+  -e "OLLAMA_API_BASE=${OLLAMA_URL}" \
+  -e "OLLAMA_MODEL=${MODEL}" \
+  -e "OLLAMA_CONTEXT_LENGTH=${CONTEXT}" \
+  -e "GIT_AUTHOR_NAME=${GIT_NAME}" \
+  -e "GIT_AUTHOR_EMAIL=${GIT_EMAIL}" \
+  -e "GIT_COMMITTER_NAME=${GIT_NAME}" \
+  -e "GIT_COMMITTER_EMAIL=${GIT_EMAIL}" \
+  --ollama-box-image "$IMAGE" ${@+"$@"} || rc=$?
+exit "$rc"

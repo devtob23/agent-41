@@ -1,0 +1,26 @@
+# Agent "opencode" for ollama-box: OpenCode with the local Ollama model.
+# Usage: ollama-box --agent opencode
+# Recommended: a model with tool support; ollama-box sets the context window to 32768.
+# ollama-box sets SHELL_IMAGE to match --with.
+ARG SHELL_IMAGE=localhost/ollama-agent-shell:latest
+FROM ${SHELL_IMAGE}
+
+USER root
+
+
+# Install OpenCode and the Ollama provider (OpenAI-compatible) at build time,
+# because the container has no internet at runtime.
+RUN HOME=/root npm install -g opencode-ai @ai-sdk/openai-compatible
+
+# Don't read Claude Code instruction files.
+ENV OPENCODE_DISABLE_CLAUDE_CODE=1
+
+# Hand the home directory to the agent user (1000). At runtime ollama-box creates a fresh
+# /home/agent and Podman copies the image contents into it, including ownership.
+RUN rm -rf /home/agent/.npm /home/agent/.cache \
+    && mkdir -p /home/agent \
+    && chown -R 1000:1000 /home/agent
+
+# The configuration is generated at startup from OLLAMA_HOST and OLLAMA_MODEL and passed via
+# OPENCODE_CONFIG_CONTENT: only the Ollama provider, no auto-update.
+ENTRYPOINT ["python3", "-c", "import os, json, sys\nh = os.environ['OLLAMA_HOST']\nm = os.environ['OLLAMA_MODEL']\ncfg = {'$schema': 'https://opencode.ai/config.json', 'autoupdate': False, 'model': 'ollama/' + m, 'small_model': 'ollama/' + m, 'enabled_providers': ['ollama'], 'provider': {'ollama': {'npm': '@ai-sdk/openai-compatible', 'name': 'Ollama (lokal)', 'options': {'baseURL': h + '/v1'}, 'models': {m: {'name': m}}}}}\nos.environ['OPENCODE_CONFIG_CONTENT'] = json.dumps(cfg)\nos.execvp('opencode', ['opencode'] + sys.argv[1:])"]

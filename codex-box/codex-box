@@ -1,0 +1,438 @@
+#!/usr/bin/env bash
+# codex-box: starts Codex in an isolated Podman container for a project.
+# Help: codex-box --help
+set -euo pipefail
+BOX_VERSION="0.3.0"
+BOX_NAME="codex-box"
+CONFIGURE=0
+ROOT_VARIABLE="CODEX_BOX_ROOT"
+
+# ============================================================
+# SETTING: folder that contains your projects.
+# Set it with the environment variable CODEX_BOX_ROOT, e.g. in ~/.profile.
+# codex-box only starts directly in a project inside it,
+# i.e. in <PROJECTS_ROOT>/<project>, not deeper and not higher.
+# ============================================================
+PROJECTS_ROOT="${CODEX_BOX_ROOT:-}"
+
+CONF_DIR="${CODEX_BOX_DIR:-$HOME/.config/codex-box}"
+
+die() {
+  echo "codex-box: $*" >&2
+  exit 1
+}
+
+# Plain data, never sourced as shell code. Environment overrides the saved path.
+configure_projects() {
+  local saved="${CONF_DIR}/projects-root" candidate answer
+  candidate="$PROJECTS_ROOT"
+  if [ "$CONFIGURE" = 0 ] && [ -f "$saved" ]; then
+    if [ -z "$candidate" ]; then IFS= read -r candidate < "$saved" || true; fi
+  elif [ -t 0 ]; then
+    candidate="${candidate:-$HOME/yourProjectPath}"
+    while true; do
+      read -e -r -p "Projects root [${candidate}] (Tab completes paths): " answer || die "Setup aborted."
+      candidate="${answer:-$candidate}"
+      case "$candidate" in '~') candidate="$HOME" ;; '~/'*) candidate="$HOME/${candidate#\~/}" ;; esac
+      if [ ! -d "$candidate" ]; then echo "Folder does not exist. Please try again." >&2; continue; fi
+      candidate="$(cd "$candidate" && pwd -P)"
+      if [ "$candidate" = / ] || [ "$candidate" = "$(cd "$HOME" && pwd -P)" ]; then
+        echo "Please choose a dedicated projects root, not / or HOME." >&2; continue
+      fi
+      read -r -p "Save ${ROOT_VARIABLE}=${candidate}? [y/N]: " answer || die "Setup aborted."
+      case "$answer" in y|Y|yes|Yes|YES) break ;; *) echo "Please edit the path." >&2 ;; esac
+    done
+    mkdir -p "$CONF_DIR"
+    (umask 077; printf '%s\n' "$candidate" > "$saved")
+  elif [ -z "$candidate" ]; then
+    die "First start needs a terminal; alternatively set ${ROOT_VARIABLE}."
+  fi
+  [ -d "$candidate" ] || die "Projects root '${candidate}' does not exist. Use --configure to change it."
+  PROJECTS_ROOT="$(cd "$candidate" && pwd -P)"
+  export "${ROOT_VARIABLE}=${PROJECTS_ROOT}"
+}
+
+# Podman -v uses colons as field separators; reject ambiguous host paths.
+validate_project_path() {
+  case "$1" in
+    *:*|*,*) die "Project path must not contain a colon or comma." ;;
+  esac
+}
+
+show_version() {
+  printf '%s %s\nScript: %s\nConfig: %s\n' "$BOX_NAME" "$BOX_VERSION" "$0" "$CONF_DIR"
+}
+
+# --- Platform: Linux, macOS (Podman machine) or Windows via WSL2 ---
+detect_platform() {
+  case "$(uname -s)" in
+    Linux)
+      if grep -qi microsoft /proc/version 2>/dev/null; then
+        PLATFORM="wsl"
+      else
+        PLATFORM="linux"
+      fi ;;
+    Darwin) PLATFORM="macos" ;;
+    MINGW*|MSYS*|CYGWIN*) PLATFORM="windows" ;;
+    *) PLATFORM="unknown" ;;
+  esac
+}
+
+# Checks that Podman is installed, recent enough and reachable.
+check_podman() {
+  [ "$PLATFORM" != "windows" ] \
+    || die "On Windows, please run inside WSL2. For the Command Prompt there is windows/codex-box.cmd (see README)."
+  command -v podman >/dev/null 2>&1 || die "podman is not installed. See README, section Requirements."
+  [ "$(id -u)" != "0" ] || die "Do not run as root; rootless Podman is required."
+  local version major minor rest rootless
+  version="$(podman --version 2>/dev/null | awk '{print $NF}')"
+  major="${version%%.*}"
+  rest="${version#*.}"
+  minor="${rest%%.*}"
+  [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ ]] || die "Could not determine the Podman version."
+  if [ "$major" -lt 4 ] || { [ "$major" -eq 4 ] && [ "$minor" -lt 4 ]; }; then
+    die "Podman ${version} is too old; version 4.4 or later is required."
+  fi
+  if ! podman info >/dev/null 2>&1; then
+    [ "$PLATFORM" != "macos" ] || die "Podman is not responding. Is the Podman machine running? Start it with: podman machine start"
+    die "Podman is not responding (podman info fails)."
+  fi
+  rootless="$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null)" \
+    || die "Could not determine whether Podman runs rootless."
+  [ "$rootless" = true ] || die "Podman must run rootless, also over a remote connection."
+  case "$PLATFORM" in
+    macos|wsl) echo "codex-box: Note: macOS and Windows/WSL2 are experimental and not tested in practice." >&2 ;;
+  esac
+  [ "$PLATFORM" != "unknown" ] || echo "codex-box: Warning: unknown operating system '$(uname -s)', treating it as Linux." >&2
+}
+
+# Network options for pasta. Newer pasta versions can disable access to the host.
+# Older ones lack these options; then plain pasta without extra options is used.
+pasta_opts() {
+  local full="pasta:--map-guest-addr,none,--map-host-loopback,none"
+  if [ "$PLATFORM" = "macos" ]; then
+    echo "$full"
+    return 0
+  fi
+  if command -v pasta >/dev/null 2>&1 && pasta --help 2>&1 | grep -q -- '--map-guest-addr'; then
+    echo "$full"
+    return 0
+  fi
+  echo "codex-box: Note: older pasta version, the extra options that block host access are skipped." >&2
+  echo "pasta"
+}
+
+# Appends a pasta option to existing network options.
+add_pasta_opt() {
+  local opts="$1"
+  local extra="$2"
+  [ -n "$extra" ] || die "internal error: no pasta option."
+  case "$opts" in
+    *:*) echo "${opts},${extra}" ;;
+    *) echo "${opts}:${extra}" ;;
+  esac
+}
+
+show_help() {
+  cat <<EOF
+codex-box – run Codex isolated in a Podman container
+
+USAGE
+  cd ${PROJECTS_ROOT}/<project>
+  codex-box [options] [arguments for codex]
+
+OPTIONS
+  --version     Show the installed script version and paths
+  --configure   Set up the projects root again
+  -h, --help     Show this help
+  --login        Log in to Codex (device code, required for the container)
+  --with <list>  Build extra toolchains into the image, comma-separated:
+                 cpp go java lua perl php ruby rust (or all), e.g. --with rust,go
+                 Default is a lean image (Node, Python, Git, GCC/Make).
+                 Permanently: CODEX_BOX_WITH=rust,go
+  --rebuild      Rebuild the base images (e.g. to update Codex)
+  Everything else is passed unchanged to codex, e.g. a first task:
+    codex-box "Explain the structure of this project"
+
+WHERE CAN IT START?
+  Only directly in a project folder:   ${PROJECTS_ROOT}/<project>
+  Rejected:
+    ${PROJECTS_ROOT} itself              (otherwise all projects would be visible)
+    ${PROJECTS_ROOT}/<project>/<subfolder>
+    any folder outside ${PROJECTS_ROOT}
+
+WHICH IMAGE?
+  Default: lean image         -> codex-base  (Codex, general development tools)
+  With --with rust,go etc.    -> codex-base-go-rust (one image per selection)
+
+WHAT THE AGENT SEES IN THE CONTAINER
+  Files:     only the project folder, at /work/<project> in the container
+  Network:   internet yes; your host and the home network are blocked
+  Rights:    no special privileges, no Git credentials (you push yourself)
+  Sandbox:   the built-in Codex sandbox is off (danger-full-access),
+             the container is the boundary. Codex asks when needed (on-request).
+  Login:     in the volume codex-config, shared by all projects
+
+ENVIRONMENT VARIABLES
+  CODEX_BOX_ROOT=<folder>      projects root instead of ${PROJECTS_ROOT}
+  CODEX_BOX_DIR=<folder>       folder with the Containerfiles instead of ${CONF_DIR}
+  CODEX_BOX_PCAP=1             capture all network traffic to ${CONF_DIR}/pcap/
+  OPENAI_API_KEY               passed through if set
+
+FILES
+  ${CONF_DIR}/Containerfile.codex-base
+EOF
+}
+
+# --- Optional toolchains (--with / CODEX_BOX_WITH) ---
+# The default image is lean. Each selection yields its own image (e.g. codex-base-go-rust).
+TOOLCHAINS_ALL="cpp go java lua perl php ruby rust"
+WITH="${CODEX_BOX_WITH:-}"
+TOOLCHAIN_ARG=""
+TOOLCHAIN_TAG=""
+
+resolve_toolchains() {
+  local want="${WITH//[[:space:]]/}" item t
+  local -a items=() picked=()
+  [ -n "$want" ] || return 0
+  IFS=, read -ra items <<< "$want"
+  for item in "${items[@]}"; do
+    [ -n "$item" ] || continue
+    case " ${TOOLCHAINS_ALL} all " in
+      *" ${item} "*) ;;
+      *) die "Unknown toolchain '${item}'. Available: ${TOOLCHAINS_ALL} or all." ;;
+    esac
+  done
+  for t in $TOOLCHAINS_ALL; do
+    case ",${want}," in *",${t},"*|*",all,"*) picked+=("$t") ;; esac
+  done
+  [ "${#picked[@]}" -gt 0 ] || return 0
+  TOOLCHAIN_ARG="$(IFS=,; echo "${picked[*]}")"
+  TOOLCHAIN_TAG="-$(IFS=-; echo "${picked[*]}")"
+}
+
+# Builds a base image from CONF_DIR if it is missing or a rebuild is requested.
+ensure_image() {
+  local name="$1"
+  local file="$2"
+  local force="$3"
+  if [ "$force" = "1" ] || ! podman image exists "localhost/${name}:latest"; then
+    [ -f "${CONF_DIR}/${file}" ] || die "${CONF_DIR}/${file} is missing."
+    echo "codex-box: building ${name} ..." >&2
+    local old_id new_id
+    old_id="$(podman image inspect --format '{{.Id}}' "localhost/${name}:latest" 2>/dev/null || true)"
+    podman build --build-arg "TOOLCHAINS=${TOOLCHAIN_ARG}" -t "$name" -f "${CONF_DIR}/${file}" "$CONF_DIR"
+    # After the rebuild the previous image is untagged and still takes up space; remove it.
+    # Fails silently if it is still used by a running container.
+    new_id="$(podman image inspect --format '{{.Id}}' "localhost/${name}:latest" 2>/dev/null || true)"
+    if [ -n "$old_id" ] && [ "$old_id" != "$new_id" ]; then podman rmi "$old_id" >/dev/null 2>&1 || true; fi
+  fi
+}
+
+# --- Options of codex-box itself (help works everywhere) ---
+REBUILD=0
+LOGIN=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --version) show_version; exit 0 ;;
+    --configure) CONFIGURE=1; shift ;;
+    -h|--help)
+      show_help
+      exit 0 ;;
+    --rebuild) REBUILD=1; shift ;;
+    --login) LOGIN=1; shift ;;
+    --with) [ $# -ge 2 ] || die "--with needs a list, e.g. --with rust,go."; WITH="$2"; shift 2 ;;
+    --with=*) WITH="${1#--with=}"; shift ;;
+    *) break ;;
+  esac
+done
+resolve_toolchains
+
+configure_projects
+[ "$CONFIGURE" = 0 ] || exit 0
+
+detect_platform
+check_podman
+
+# On macOS the project lives on a virtiofs volume inside the Podman machine;
+# SELinux relabeling (:Z) is not supported there.
+MOUNT_Z=":Z"
+if [ "$PLATFORM" = "macos" ]; then
+  MOUNT_Z=""
+fi
+
+# --- Safety check: only directly in <PROJECTS_ROOT>/<project> ---
+# Both paths are resolved (symlinks, ..) so the check cannot be bypassed.
+[ -d "$PROJECTS_ROOT" ] || die "Projects root '${PROJECTS_ROOT}' does not exist. Create the folder or set CODEX_BOX_ROOT (see README)."
+ROOT_REAL="$(cd "$PROJECTS_ROOT" && pwd -P)"
+PROJECT_DIR="$(pwd -P)"
+validate_project_path "$PROJECT_DIR"
+
+case "$ROOT_REAL" in
+  "/"|"$(cd "$HOME" && pwd -P)")
+    die "PROJECTS_ROOT must not be '/' or your home directory." ;;
+esac
+
+case "$PROJECT_DIR" in
+  "$ROOT_REAL")
+    die "You are in the projects root itself (${ROOT_REAL}). Please change into a project: cd ${ROOT_REAL}/<project>" ;;
+  "$ROOT_REAL"/*/*)
+    REL="${PROJECT_DIR#"$ROOT_REAL"/}"
+    die "You are in a subfolder of a project. Please start in the project itself: cd ${ROOT_REAL}/${REL%%/*}" ;;
+  "$ROOT_REAL"/?*)
+    ;;
+  *)
+    die "'${PROJECT_DIR}' is not inside ${ROOT_REAL}. codex-box only starts in ${ROOT_REAL}/<project>. Help: codex-box --help" ;;
+esac
+
+# --- Ensure base images ---
+ensure_image "codex-base${TOOLCHAIN_TAG}" Containerfile.codex-base "$REBUILD"
+
+# --- Choose image ---
+PROJECT="$(basename "$PROJECT_DIR" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9._-' '-')"
+PROJECT="${PROJECT%-}"
+
+IMAGE="codex-base${TOOLCHAIN_TAG}"
+
+# --- Environment ---
+GIT_NAME="$(git config user.name || true)"
+GIT_EMAIL="$(git config user.email || true)"
+ENV_ARGS=(
+  -e "GIT_AUTHOR_NAME=${GIT_NAME}"
+  -e "GIT_AUTHOR_EMAIL=${GIT_EMAIL}"
+  -e "GIT_COMMITTER_NAME=${GIT_NAME}"
+  -e "GIT_COMMITTER_EMAIL=${GIT_EMAIL}"
+)
+if [ -n "${OPENAI_API_KEY:-}" ]; then
+  ENV_ARGS+=(-e OPENAI_API_KEY)
+fi
+
+# --- Arguments for codex ---
+# Inside the container the built-in Codex sandbox is disabled (danger-full-access),
+# because the container is the boundary. Codex asks on its own when needed (on-request).
+if [ "$LOGIN" = "1" ]; then
+  CODEX_ARGS=(login --device-auth)
+else
+  CODEX_ARGS=(--sandbox danger-full-access --ask-for-approval on-request ${@+"$@"})
+fi
+
+# --- Network ---
+# Internet stays reachable (Codex needs the API).
+# Access to your host is blocked:
+#   --map-guest-addr,none     host.containers.internal no longer leads to the host
+#   --map-host-loopback,none  no redirection to the host's loopback services
+# The home network is blocked by FIREWALL_SCRIPT (further below) inside the container.
+NET_OPTS="$(pasta_opts)"
+
+# Optional capture of all container traffic:  CODEX_BOX_PCAP=1 codex-box
+if [ "${CODEX_BOX_PCAP:-0}" = "1" ]; then
+  PCAP_DIR="${CONF_DIR}/pcap"
+  mkdir -p "$PCAP_DIR"
+  PCAP_FILE="${PCAP_DIR}/${PROJECT}-$(date +%Y%m%d-%H%M%S).pcap"
+  NET_OPTS="$(add_pasta_opt "$NET_OPTS" "--pcap,${PCAP_FILE}")"
+  echo "codex-box: writing capture to ${PCAP_FILE}" >&2
+fi
+
+echo "codex-box: ${PROJECT_DIR} -> /work/${PROJECT} (Image: ${IMAGE})" >&2
+
+# --- Firewall script, runs first inside the container (as root) ---
+# Blocks host and home network, then switches to node, drops all privileges and starts Codex.
+# If the firewall cannot be set up, Codex does not start.
+read -r -d '' FIREWALL_SCRIPT <<'INIT' || true
+set -euo pipefail
+
+fail() {
+  echo "codex-box (container): $*" >&2
+  echo "codex-box (container): aborted, Codex will not be started." >&2
+  exit 1
+}
+
+[ "$(id -u)" = "0" ] || fail "must start as root. Please start it via codex-box."
+
+# Private, local and reserved ranges
+BLOCK_V4=(
+  0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 169.254.0.0/16 172.16.0.0/12
+  192.168.0.0/16 198.18.0.0/15 224.0.0.0/4 240.0.0.0/4
+)
+BLOCK_V6=(fc00::/7 fe80::/10 ff00::/8)
+
+# DNS servers from resolv.conf (at most 5 per protocol)
+mapfile -t DNS4 < <(awk '/^nameserver/ && $2 !~ /:/ {print $2}' /etc/resolv.conf | head -n 5)
+mapfile -t DNS6 < <(awk '/^nameserver/ && $2 ~ /:/ {print $2}' /etc/resolv.conf | head -n 5)
+
+# Own networks (inherited from the host). IPv6 always as /64 so the whole home network prefix is covered.
+mapfile -t OWN4 < <(ip -o -4 addr show scope global | awk '{print $4}' | head -n 10)
+mapfile -t OWN6 < <(ip -o -6 addr show scope global | awk '{split($4, a, "/"); print a[1] "/64"}' | head -n 10)
+
+setup_v4() {
+  iptables -A OUTPUT -o lo -j ACCEPT || return 1
+  local ns
+  for ns in "${DNS4[@]}"; do
+    iptables -A OUTPUT -d "$ns" -p udp --dport 53 -j ACCEPT || return 1
+    iptables -A OUTPUT -d "$ns" -p tcp --dport 53 -j ACCEPT || return 1
+  done
+  local net
+  for net in "${BLOCK_V4[@]}" "${OWN4[@]}"; do
+    iptables -A OUTPUT -d "$net" -j REJECT || return 1
+  done
+  return 0
+}
+
+setup_v6() {
+  ip6tables -A OUTPUT -o lo -j ACCEPT || return 1
+  local ns
+  for ns in "${DNS6[@]}"; do
+    ip6tables -A OUTPUT -d "$ns" -p udp --dport 53 -j ACCEPT || return 1
+    ip6tables -A OUTPUT -d "$ns" -p tcp --dport 53 -j ACCEPT || return 1
+  done
+  local net
+  for net in "${BLOCK_V6[@]}" "${OWN6[@]}"; do
+    ip6tables -A OUTPUT -d "$net" -j REJECT || return 1
+  done
+  return 0
+}
+
+setup_v4 || fail "could not set up the IPv4 firewall."
+
+if ! setup_v6; then
+  # Harmless if the container has no IPv6 addresses, otherwise abort.
+  if [ -n "$(ip -o -6 addr show scope global)" ]; then
+    fail "could not set up the IPv6 firewall."
+  fi
+  echo "codex-box (container): no IPv6 in the container, IPv6 rules skipped." >&2
+fi
+
+echo "codex-box (container): Firewall active, home network blocked (own networks: ${OWN4[*]:-none} ${OWN6[*]:-})." >&2
+
+# SETPCAP is only needed to clear the capability bounding set.
+# Switch to node and drop all privileges for good.
+export HOME=/home/node
+export USER=node
+exec setpriv --reuid=1000 --regid=1000 --init-groups \
+  --inh-caps=-all --bounding-set=-all --no-new-privs \
+  -- codex "$@"
+INIT
+
+# --userns=keep-id:...   your user becomes node in the container; files belong to you
+# --user 0 + cap-add     only for FIREWALL_SCRIPT: set up firewall, then switch to node.
+#                        Codex itself then runs without any special privileges.
+# -v PROJECT_DIR         only this folder is visible
+# -v codex-config        login and settings, shared across all projects
+# --network              internet yes, your host no
+exec podman run --rm -it \
+  --hostname "codex-${PROJECT}" \
+  --userns=keep-id:uid=1000,gid=1000 \
+  --user 0:0 \
+  --cap-drop=ALL \
+  --cap-add=NET_ADMIN \
+  --cap-add=SETUID \
+  --cap-add=SETGID \
+  --cap-add=SETPCAP \
+  --security-opt no-new-privileges \
+  --network "$NET_OPTS" \
+  -v "${PROJECT_DIR}:/work/${PROJECT}${MOUNT_Z}" \
+  -v codex-config:/home/node/.codex \
+  -w "/work/${PROJECT}" \
+  "${ENV_ARGS[@]}" \
+  --entrypoint bash \
+  "$IMAGE" -c "$FIREWALL_SCRIPT" codex-box-firewall "${CODEX_ARGS[@]}"

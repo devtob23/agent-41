@@ -1,0 +1,19 @@
+{
+  "attribution": {
+    "commit": "",
+    "pr": ""
+  },
+  "permissions": {
+    "deny": [
+      "Bash(git push *)",
+      "Bash(git reset --hard *)",
+      "Bash(git clean *)",
+      "Bash(git commit --amend *)",
+      "Bash(git rebase *)",
+      "Bash(git filter-branch *)",
+      "Bash(git reflog expire *)",
+      "Bash(git gc *)",
+      "Bash(git config *)"
+    ]
+  }
+}

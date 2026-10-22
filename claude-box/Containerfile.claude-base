@@ -1,0 +1,46 @@
+# Shared base for all projects: Node, Git, Python, Claude Code, firewall.
+FROM docker.io/library/node:22-bookworm
+
+# TypeScript tools for all agents.
+RUN npm install -g typescript
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      git curl wget ca-certificates ripgrep less procps unzip zip jq \
+      python3 python3-pip python3-venv \
+      build-essential \
+      iptables iproute2 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Claude Code globally. Updates happen by rebuilding the image (claude-box --rebuild).
+RUN npm install -g @anthropic-ai/claude-code
+ENV DISABLE_AUTOUPDATER=1
+
+# Optional toolchains, selected with --with (comma-separated; empty = none).
+ARG TOOLCHAINS=""
+RUN set -eu; pkgs=""; \
+    for t in $(echo "$TOOLCHAINS" | tr ',' ' '); do \
+      case "$t" in \
+        cpp)  pkgs="$pkgs cmake ninja-build pkg-config gdb" ;; \
+        go)   pkgs="$pkgs golang-go" ;; \
+        java) pkgs="$pkgs default-jdk maven" ;; \
+        lua)  pkgs="$pkgs lua5.4" ;; \
+        perl) pkgs="$pkgs perl" ;; \
+        php)  pkgs="$pkgs php-cli php-mbstring php-xml composer" ;; \
+        ruby) pkgs="$pkgs ruby ruby-dev bundler" ;; \
+        rust) pkgs="$pkgs rustc cargo" ;; \
+        *) echo "Unknown toolchain: $t" >&2; exit 1 ;; \
+      esac; \
+    done; \
+    if [ -n "$pkgs" ]; then \
+      apt-get update && apt-get install -y --no-install-recommends $pkgs \
+      && rm -rf /var/lib/apt/lists/*; \
+    fi
+
+# Login, settings and history end up in a volume under this path.
+ENV CLAUDE_CONFIG_DIR=/home/node/.claude
+RUN mkdir -p /home/node/.claude /work \
+    && chown -R node:node /home/node/.claude /work
+
+USER node
+WORKDIR /work
+ENTRYPOINT ["claude"]
