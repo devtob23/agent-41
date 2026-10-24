@@ -46,7 +46,7 @@ Per-box guides: [claude-box](claude-box/README.md), [codex-box](codex-box/README
 - **No host Git credentials.** Credentials already inside the project can still be
   used. Review and push commits yourself.
 
-Cloud agents can send anything in the project to the internet; a container does
+Keep in mind: Cloud agents can send anything in the project to the internet; a container does
 not prevent that.
 
 ## Requirements
