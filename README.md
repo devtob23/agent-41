@@ -128,9 +128,7 @@ codex-box                # Codex
 > can't reach the container, so it never completes. Alternatively set
 > `OPENAI_API_KEY`. Details: [codex-box guide](codex-box/README.md#logging-in-once).
 
-On first start each box asks for the projects root (here `~/projects`); the path
-prompt supports Tab completion. Arguments the launcher doesn't recognise are passed
-to the agent, e.g. `claude-box --resume`. For local models see [Ollama](#ollama).
+On first start each box asks for the projects root. For local models see [Ollama](#ollama).
 
 | Option (all boxes) | Effect |
 |---|---|
